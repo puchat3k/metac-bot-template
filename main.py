@@ -678,17 +678,20 @@ if __name__ == "__main__":
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        # llms={
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o",
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
+        # Fixed free baseline. Keep the underlying model constant so changes in
+        # forecasting performance can be attributed to methodology rather than
+        # silent model upgrades or OpenRouter free-router model rotation.
+        llms={
+            "default": GeneralLlm(
+                model="openrouter/google/gemma-4-26b-a4b-it:free",
+                temperature=0.3,
+                timeout=60,
+                allowed_tries=2,
+            ),
+            "summarizer": "openrouter/google/gemma-4-26b-a4b-it:free",
+            "researcher": "openrouter/google/gemma-4-26b-a4b-it:free",
+            "parser": "openrouter/google/gemma-4-26b-a4b-it:free",
+        },
     )
 
     # Per-mode tournament URL shown in the summary banner footer. These
