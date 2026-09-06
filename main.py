@@ -672,7 +672,7 @@ if __name__ == "__main__":
     # uncomment and edit to pin specific models.
     template_bot = SummerTemplateBot2026(
         research_reports_per_question=1,
-        predictions_per_research_report=5,
+        predictions_per_research_report=1 if run_mode == "test_questions" else 5,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=None,
@@ -683,14 +683,14 @@ if __name__ == "__main__":
         # silent model upgrades or OpenRouter free-router model rotation.
         llms={
             "default": GeneralLlm(
-                model="openrouter/google/gemma-4-26b-a4b-it:free",
+                model="openrouter/liquid/lfm-2.5-2.6b:free",
                 temperature=0.3,
                 timeout=60,
                 allowed_tries=2,
             ),
-            "summarizer": "openrouter/google/gemma-4-26b-a4b-it:free",
-            "researcher": "openrouter/google/gemma-4-26b-a4b-it:free",
-            "parser": "openrouter/google/gemma-4-26b-a4b-it:free",
+            "summarizer": "openrouter/liquid/lfm-2.5-2.6b:free",
+            "researcher": "openrouter/liquid/lfm-2.5-2.6b:free",
+            "parser": "openrouter/liquid/lfm-2.5-2.6b:free",
         },
     )
 
