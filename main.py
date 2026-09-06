@@ -690,7 +690,8 @@ if __name__ == "__main__":
             ),
             "summarizer": "openrouter/liquid/lfm-2.5-2.6b:free",
             "researcher": "openrouter/liquid/lfm-2.5-2.6b:free",
-            "parser": "openrouter/liquid/lfm-2.5-2.6b:free",
+            # Parsing is mechanical infrastructure, not forecasting intelligence.
+            "parser": "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
         },
     )
 
