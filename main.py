@@ -730,13 +730,15 @@ if __name__ == "__main__":
             )
         )
     elif run_mode == "test_questions":
-        # The bot-testing-area tournament contains all question types and is
-        # the recommended target for smoke-testing your bot.
-        # https://www.metaculus.com/tournament/bot-testing-area/
+        # Fast end-to-end smoke test on one current bot-testing-area question.
+        # Use the full tournament workflow separately for broader validation.
         template_bot.skip_previously_forecasted_questions = False
+        smoke_question = client.get_question_by_url(
+            "https://www.metaculus.com/questions/45517"
+        )
         forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                "bot-testing-area", return_exceptions=True
+            template_bot.forecast_questions(
+                [smoke_question], return_exceptions=True
             )
         )
 
