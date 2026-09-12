@@ -8,7 +8,7 @@ import requests
 
 KALSHI_BASE = "https://external-api.kalshi.com/trade-api/v2"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = os.getenv("PAPER_MODEL", "liquid/lfm-2.5-2.6b:free")
+MODEL = os.getenv("PAPER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
 MAX_MARKETS = int(os.getenv("KALSHI_MAX_MARKETS", "8"))
 PAPER_NOTIONAL_USD = float(os.getenv("PAPER_NOTIONAL_USD", "10"))
 OUTPUT_DIR = Path(os.getenv("FORECAST_OUTPUT_ROOT", "outputs")) / "kalshi"
@@ -56,7 +56,7 @@ def fetch_open_markets():
     response = requests.get(
         f"{KALSHI_BASE}/markets",
         params={"status": "open", "mve_filter": "exclude", "limit": 300},
-        headers={"user-agent": "pk2sl-forecast-mvp/0.1"},
+        headers={"user-agent": "pk2sl-forecast-mvp/0.2"},
         timeout=30,
     )
     response.raise_for_status()
@@ -94,7 +94,11 @@ def select_markets(markets):
 
 
 def parse_probability(text):
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("empty_model_output")
     text = text.strip()
+
+    # First accept a clean JSON response.
     try:
         data = json.loads(text)
         value = float(data["probability"])
@@ -104,12 +108,25 @@ def parse_probability(text):
     except Exception:
         pass
 
-    match = re.search(r"(?:probability\s*[:=]\s*)?(0(?:\.\d+)?|1(?:\.0+)?)", text, re.I)
-    if match:
-        value = float(match.group(1))
+    # Some reasoning models emit prose before the requested JSON. Only accept an
+    # explicit probability field, never arbitrary decimals or arithmetic in prose.
+    explicit = re.findall(
+        r'["\']?probability["\']?\s*[:=]\s*(0(?:\.\d+)?|1(?:\.0+)?)',
+        text,
+        flags=re.I,
+    )
+    if explicit:
+        value = float(explicit[-1])
         if 0 <= value <= 1:
-            return value, text[:2000]
-    raise ValueError("could_not_parse_probability")
+            return value, text[:4000]
+
+    percent = re.findall(r'probability\s*[:=]\s*(\d{1,3}(?:\.\d+)?)\s*%', text, flags=re.I)
+    if percent:
+        value = float(percent[-1]) / 100.0
+        if 0 <= value <= 1:
+            return value, text[:4000]
+
+    raise ValueError("no_explicit_probability_in_model_output")
 
 
 def forecast_market(market):
@@ -146,19 +163,20 @@ Probability must be a decimal between 0 and 1."""
         json={
             "model": MODEL,
             "temperature": 0.3,
-            "max_tokens": 450,
+            "max_tokens": 1200,
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are a calibrated probabilistic forecaster. Return only valid JSON.",
+                    "content": "You are a calibrated probabilistic forecaster. Conclude with an explicit probability field between 0 and 1.",
                 },
                 {"role": "user", "content": prompt},
             ],
         },
-        timeout=75,
+        timeout=120,
     )
     response.raise_for_status()
-    content = response.json()["choices"][0]["message"]["content"]
+    message = response.json()["choices"][0]["message"]
+    content = message.get("content") or message.get("reasoning")
     probability, rationale = parse_probability(content)
     return probability, rationale, prompt
 
@@ -183,7 +201,7 @@ def main():
                     "venue": "kalshi-paper",
                     "source_opportunity_id": ticker,
                     "title": market.get("title"),
-                    "model_key": f"openrouter:{MODEL}:kalshi-mvp-v1",
+                    "model_key": f"openrouter:{MODEL}:kalshi-mvp-v2",
                     "forecast_probability": round(forecast_p, 6),
                     "market_probability": round(market_p, 6),
                     "edge": round(edge, 6),
@@ -196,7 +214,8 @@ def main():
                     "metadata": {
                         "paper_only": True,
                         "real_money": False,
-                        "prompt_version": "kalshi-mvp-v1",
+                        "training_eligible": True,
+                        "prompt_version": "kalshi-mvp-v2",
                         "model": MODEL,
                         "rationale": rationale,
                         "prompt": prompt,
@@ -227,6 +246,7 @@ def main():
                 "failures": failures,
                 "model": MODEL,
                 "paper_only": True,
+                "parser_version": "strict-v2",
             },
             indent=2,
         ),
