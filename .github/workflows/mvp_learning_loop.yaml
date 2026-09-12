@@ -2,6 +2,13 @@ name: MVP Forecast Learning Loop
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "metaculus_mvp.py"
+      - "kalshi_paper.py"
+      - "ingest_records.py"
+      - ".github/workflows/mvp_learning_loop.yaml"
   schedule:
     - cron: "23 */6 * * *"
 
