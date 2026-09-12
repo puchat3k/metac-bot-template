@@ -54,8 +54,8 @@ jobs:
         run: poetry run python kalshi_paper.py
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          PAPER_MODEL: liquid/lfm-2.5-2.6b:free
-          KALSHI_MAX_MARKETS: "8"
+          PAPER_MODEL: nvidia/nemotron-3-super-120b-a12b:free
+          KALSHI_MAX_MARKETS: "4"
           PAPER_NOTIONAL_USD: "10"
           FORECAST_OUTPUT_ROOT: outputs
 
