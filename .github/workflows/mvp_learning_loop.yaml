@@ -1,0 +1,68 @@
+name: MVP Forecast Learning Loop
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 */6 * * *"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: mvp-forecast-learning-loop
+  cancel-in-progress: false
+
+jobs:
+  learn:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root
+
+      - name: Forecast on Metaculus
+        run: poetry run python metaculus_mvp.py
+        env:
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          FORECAST_OUTPUT_ROOT: outputs
+
+      - name: Forecast Kalshi paper markets
+        run: poetry run python kalshi_paper.py
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PAPER_MODEL: liquid/lfm-2.5-2.6b:free
+          KALSHI_MAX_MARKETS: "8"
+          PAPER_NOTIONAL_USD: "10"
+          FORECAST_OUTPUT_ROOT: outputs
+
+      - name: Persist and resolve training records
+        run: poetry run python ingest_records.py
+        env:
+          FORECAST_OUTPUT_ROOT: outputs
+          FORECAST_INGEST_URL: https://cfoleiwmizgayhecyymq.supabase.co/functions/v1/forecast-ingest
+
+      - name: Preserve run evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: forecast-learning-${{ github.run_id }}
+          path: outputs/
+          if-no-files-found: warn
+          retention-days: 90
