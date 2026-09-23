@@ -76,14 +76,31 @@ def market_probability(market):
 
 
 def fetch_open_markets():
-    response = requests.get(
-        f"{KALSHI_BASE}/markets",
-        params={"status": "open", "mve_filter": "exclude", "limit": 300},
-        headers={"user-agent": "pk2sl-forecast-mvp/0.4"},
-        timeout=30,
-    )
-    response.raise_for_status()
-    return response.json().get("markets", [])
+    """Walk the public cursor until the entire current open-market set is loaded."""
+    markets = []
+    cursor = None
+    seen_cursors = set()
+    while True:
+        params = {"status": "open", "mve_filter": "exclude", "limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+        response = requests.get(
+            f"{KALSHI_BASE}/markets",
+            params=params,
+            headers={"user-agent": "pk2sl-forecast-mvp/0.5"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        body = response.json()
+        markets.extend(body.get("markets", []))
+        next_cursor = body.get("cursor")
+        if not next_cursor:
+            break
+        if next_cursor in seen_cursors:
+            raise RuntimeError("kalshi pagination cursor repeated")
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    return markets
 
 
 def _learning_score(market, close_at, bid, ask):
@@ -116,10 +133,10 @@ def _learning_score(market, close_at, bid, ask):
     )
 
 
-def select_markets(markets):
+def coverage_markets(markets):
+    """All currently tradable binary markets with a usable paper entry price."""
     now = datetime.now(timezone.utc)
-    horizon = now + timedelta(days=60)
-    candidates = []
+    covered = []
     for market in markets:
         if market.get("market_type") != "binary" or market.get("is_provisional"):
             continue
@@ -128,11 +145,29 @@ def select_markets(markets):
             close_at = datetime.fromisoformat(str(close_raw).replace("Z", "+00:00"))
         except Exception:
             continue
-        if close_at <= now or close_at > horizon:
+        if close_at <= now:
             continue
 
         probability, bid, ask = market_probability(market)
-        if probability is None or probability <= 0.02 or probability >= 0.98:
+        if probability is None or probability <= 0 or probability >= 1:
+            continue
+        covered.append((close_at, market, probability, bid, ask))
+
+    covered.sort(key=lambda row: row[0])
+    if MAX_MARKETS > 0:
+        return covered[:MAX_MARKETS]
+    return covered
+
+
+def select_markets(covered):
+    """Quality-ranked subset eligible for scarce model inference."""
+    now = datetime.now(timezone.utc)
+    horizon = now + timedelta(days=60)
+    candidates = []
+    for close_at, market, probability, bid, ask in covered:
+        if close_at > horizon:
+            continue
+        if probability <= 0.02 or probability >= 0.98:
             continue
         if bid is not None and ask is not None and ask - bid > 0.20:
             continue
@@ -141,8 +176,6 @@ def select_markets(markets):
         candidates.append((score, close_at, market, probability, bid, ask))
 
     candidates.sort(key=lambda row: (-row[0], row[1]))
-    if MAX_MARKETS > 0:
-        return candidates[:MAX_MARKETS]
     return candidates
 
 
@@ -553,13 +586,15 @@ def main():
     now = datetime.now(timezone.utc)
     bucket = six_hour_bucket(now)
     markets = fetch_open_markets()
-    selected = select_markets(markets)
+    covered = coverage_markets(markets)
+    selected = select_markets(covered)
 
     records = []
     failures = []
     primary_results = {}
 
     forecast_targets = selected[: max(0, MODEL_FORECASTS)]
+    forecast_target_tickers = {row[2].get("ticker") for row in forecast_targets}
     with ThreadPoolExecutor(max_workers=min(FORECAST_WORKERS, max(1, len(forecast_targets)))) as pool:
         futures = {
             pool.submit(forecast_market, row[2]): row
@@ -581,17 +616,18 @@ def main():
     risk_records = []
     contrarian_records = []
 
-    for index, (_, close_at, market, market_p, bid, ask) in enumerate(selected):
+    for close_at, market, market_p, bid, ask in covered:
         ticker = market.get("ticker")
         primary = primary_results.get(ticker)
 
-        # Always keep a same-market baseline so every lock has a control cohort.
+        # Always keep a same-market baseline so the paper book covers the full
+        # open binary universe, even when a market is not worth an LLM call.
         reason = (
             "same_market_baseline"
             if primary is not None
             else (
                 "model_forecast_failed"
-                if index < len(forecast_targets)
+                if ticker in forecast_target_tickers
                 else "outside_model_forecast_budget"
             )
         )
@@ -637,7 +673,8 @@ def main():
             {
                 "observed_at": iso(now),
                 "markets_seen": len(markets),
-                "markets_eligible": len(selected),
+                "markets_covered": len(covered),
+                "model_candidate_markets": len(selected),
                 "paper_positions_written": len(records),
                 "primary_model_positions": primary_count,
                 "control_positions": control_count,
