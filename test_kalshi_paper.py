@@ -38,6 +38,22 @@ class KalshiPaperPortfolioTests(unittest.TestCase):
         self.assertAlmostEqual(kp.empirical_risk_multiplier(0.35, 1), 0.01, places=6)
         self.assertAlmostEqual(kp.empirical_risk_multiplier(0.05, 24), 1.0, places=6)
 
+    def test_coverage_keeps_extreme_or_wide_spread_markets_outside_model_filter(self):
+        now = datetime.now(timezone.utc)
+        market = {
+            "ticker": "EXTREME",
+            "title": "Extreme priced market",
+            "market_type": "binary",
+            "is_provisional": False,
+            "close_time": (now + timedelta(days=2)).isoformat(),
+            "yes_bid_dollars": "0.005",
+            "yes_ask_dollars": "0.025",
+            "no_bid_dollars": "0.975",
+        }
+        covered = kp.coverage_markets([market])
+        self.assertEqual(len(covered), 1)
+        self.assertEqual(kp.select_markets(covered), [])
+
     def test_full_kelly_is_zero_without_positive_edge(self):
         self.assertEqual(kp.full_kelly_fraction(0.60, 0.60), 0.0)
         self.assertGreater(kp.full_kelly_fraction(0.40, 0.60), 0.0)
