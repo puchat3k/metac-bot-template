@@ -76,7 +76,7 @@ def fetch_open_markets():
     response = requests.get(
         f"{KALSHI_BASE}/markets",
         params={"status": "open", "mve_filter": "exclude", "limit": 300},
-        headers={"user-agent": "pk2sl-forecast-mvp/0.3"},
+        headers={"user-agent": "pk2sl-forecast-mvp/0.4"},
         timeout=30,
     )
     response.raise_for_status()
@@ -90,11 +90,25 @@ def _learning_score(market, close_at, bid, ask):
     liquidity = as_float(market.get("liquidity_dollars"), 0.0) or 0.0
     spread = (ask - bid) if bid is not None and ask is not None else 0.20
     spread_quality = clamp(1 - spread / 0.20, 0, 1)
-    # Fast resolution + real liquidity produces faster, more useful feedback.
+    # Empirical overlay from the first resolved paper cohort: the unresearched
+    # generic model performed very poorly inside two hours of close. Prefer
+    # 12h-14d markets for expensive model inference while retaining minimum
+    # paper-control exposure on the rest.
+    if hours <= 2:
+        horizon_score = -6.0
+    elif hours <= 12:
+        horizon_score = -1.0
+    elif hours <= 48:
+        horizon_score = 4.0
+    elif hours <= 24 * 14:
+        horizon_score = 3.0
+    else:
+        horizon_score = 1.0
+
     return (
         math.log1p(max(0.0, volume))
         + 2.0 * math.log1p(max(0.0, liquidity))
-        + 20.0 / (hours + 4.0)
+        + horizon_score
         + 2.0 * spread_quality
     )
 
@@ -230,13 +244,56 @@ Probability must be a decimal between 0 and 1."""
     raise RuntimeError(str(last_error or "forecast_failed"))
 
 
-def strategy_probability(model_probability, market_probability_):
-    """Shrink an unproven model toward the market prior rather than trusting raw edge 1:1."""
+def effective_edge_shrink(raw_edge, horizon_hours=None):
+    """Empirical reliability overlay; provisional until a larger resolved cohort exists."""
+    shrink = MODEL_EDGE_SHRINK
+    edge = abs(raw_edge)
+    if edge >= 0.30:
+        shrink = min(shrink, 0.05)
+    elif edge >= 0.20:
+        shrink = min(shrink, 0.10)
+    elif edge >= 0.10:
+        shrink = min(shrink, 0.25)
+
+    if horizon_hours is not None:
+        if horizon_hours <= 2:
+            shrink = min(shrink, 0.05)
+        elif horizon_hours <= 12:
+            shrink = min(shrink, 0.15)
+    return shrink
+
+
+def strategy_probability(model_probability, market_probability_, horizon_hours=None):
+    """Shrink an unproven model toward the market prior using observed reliability."""
+    raw_edge = model_probability - market_probability_
+    shrink = effective_edge_shrink(raw_edge, horizon_hours)
     return clamp(
-        market_probability_ + MODEL_EDGE_SHRINK * (model_probability - market_probability_),
+        market_probability_ + shrink * raw_edge,
         0.001,
         0.999,
     )
+
+
+def empirical_risk_multiplier(raw_edge, horizon_hours):
+    """Risk overlay learned from the first 80 resolved paper positions."""
+    edge = abs(raw_edge)
+    if edge >= 0.30:
+        edge_factor = 0.10
+    elif edge >= 0.20:
+        edge_factor = 0.20
+    elif edge >= 0.10:
+        edge_factor = 0.55
+    else:
+        edge_factor = 1.00
+
+    if horizon_hours <= 2:
+        horizon_factor = 0.10
+    elif horizon_hours <= 12:
+        horizon_factor = 0.50
+    else:
+        horizon_factor = 1.00
+
+    return edge_factor * horizon_factor
 
 
 def full_kelly_fraction(side_price, win_probability):
@@ -256,15 +313,24 @@ def liquidity_quality(market, bid, ask):
 
 
 def build_primary_position(now, bucket, close_at, market, market_p, bid, ask, model_p, rationale, prompt):
-    adjusted_p = strategy_probability(model_p, market_p)
     raw_edge = model_p - market_p
+    horizon_hours = max(0.0, (close_at - now).total_seconds() / 3600)
+    shrink = effective_edge_shrink(raw_edge, horizon_hours)
+    adjusted_p = strategy_probability(model_p, market_p, horizon_hours)
     edge = adjusted_p - market_p
     direction = "yes" if edge >= 0 else "no"
     side_price = market_p if direction == "yes" else 1 - market_p
     win_probability = adjusted_p if direction == "yes" else 1 - adjusted_p
     kelly_full = full_kelly_fraction(side_price, win_probability)
     quality = liquidity_quality(market, bid, ask)
-    proposed = PAPER_BANKROLL_USD * PAPER_KELLY_FRACTION * kelly_full * max(0.20, quality)
+    empirical_multiplier = empirical_risk_multiplier(raw_edge, horizon_hours)
+    proposed = (
+        PAPER_BANKROLL_USD
+        * PAPER_KELLY_FRACTION
+        * kelly_full
+        * max(0.20, quality)
+        * empirical_multiplier
+    )
     proposed = clamp(proposed, PAPER_MIN_POSITION_USD, PAPER_MAX_POSITION_USD)
 
     ticker = market.get("ticker")
@@ -272,7 +338,7 @@ def build_primary_position(now, bucket, close_at, market, market_p, bid, ask, mo
         "venue": "kalshi-paper",
         "source_opportunity_id": ticker,
         "title": market.get("title"),
-        "model_key": f"openrouter:{MODEL}:kalshi-portfolio-v3",
+        "model_key": f"openrouter:{MODEL}:kalshi-portfolio-v4",
         "forecast_probability": round(adjusted_p, 6),
         "market_probability": round(market_p, 6),
         "edge": round(edge, 6),
@@ -286,13 +352,16 @@ def build_primary_position(now, bucket, close_at, market, market_p, bid, ask, mo
             "paper_only": True,
             "real_money": False,
             "training_eligible": True,
-            "strategy_version": "kalshi-portfolio-v3",
+            "strategy_version": "kalshi-portfolio-v4",
             "position_sizing": "market-prior-shrinkage+fractional-kelly+event-caps",
-            "prompt_version": "kalshi-portfolio-v3",
+            "prompt_version": "kalshi-portfolio-v4",
             "model": MODEL,
             "raw_model_probability": round(model_p, 6),
             "raw_model_edge": round(raw_edge, 6),
-            "model_edge_shrink": MODEL_EDGE_SHRINK,
+            "base_model_edge_shrink": MODEL_EDGE_SHRINK,
+            "effective_edge_shrink": round(shrink, 6),
+            "empirical_risk_multiplier": round(empirical_multiplier, 6),
+            "horizon_hours": round(horizon_hours, 3),
             "kelly_full": round(kelly_full, 6),
             "kelly_fraction": PAPER_KELLY_FRACTION,
             "liquidity_quality": round(quality, 6),
@@ -504,9 +573,9 @@ def main():
                 "forecast_failures": failures,
                 "model": MODEL,
                 "paper_only": True,
-                "strategy_version": "kalshi-portfolio-v3",
+                "strategy_version": "kalshi-portfolio-v4",
                 "parser_version": "strict-v2",
-                "model_edge_shrink": MODEL_EDGE_SHRINK,
+                "base_model_edge_shrink": MODEL_EDGE_SHRINK,
                 "kelly_fraction": PAPER_KELLY_FRACTION,
                 "max_event_gross_fraction": MAX_EVENT_GROSS_FRACTION,
                 "max_event_net_fraction": MAX_EVENT_NET_FRACTION,
