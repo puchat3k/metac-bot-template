@@ -74,6 +74,36 @@ class KalshiPaperPortfolioTests(unittest.TestCase):
             kp.MAX_EVENT_GROSS_FRACTION = old_event
             kp.MAX_EVENT_NET_FRACTION = old_net
 
+
+    def test_contrarian_shadow_inverts_primary_and_is_not_training_eligible(self):
+        primary = {
+            "source_opportunity_id": "TEST",
+            "title": "Test",
+            "model_key": "primary",
+            "forecast_probability": 0.52,
+            "market_probability": 0.50,
+            "edge": 0.02,
+            "direction": "yes",
+            "notional_usd": 4.0,
+            "locked_at": "2026-09-23T00:00:00+00:00",
+            "lock_bucket": "2026-09-23T00:00:00+00:00",
+            "closes_at": "2026-09-24T00:00:00+00:00",
+            "metadata": {
+                "raw_model_edge": 0.40,
+                "event_ticker": "EVENT",
+            },
+        }
+        hedge = kp.build_contrarian_position(primary)
+        self.assertEqual(hedge["direction"], "no")
+        self.assertAlmostEqual(hedge["forecast_probability"], 0.48, places=6)
+        self.assertFalse(hedge["metadata"]["training_eligible"])
+        self.assertTrue(hedge["metadata"]["shadow_challenger"])
+        self.assertEqual(hedge["notional_usd"], 2.0)
+
+    def test_contrarian_threshold_targets_only_extreme_raw_disagreement(self):
+        self.assertGreaterEqual(0.25, kp.CONTRARIAN_EDGE_THRESHOLD)
+        self.assertLess(0.10, kp.CONTRARIAN_EDGE_THRESHOLD)
+
     def test_control_position_is_not_training_eligible(self):
         now = datetime.now(timezone.utc)
         market = {
