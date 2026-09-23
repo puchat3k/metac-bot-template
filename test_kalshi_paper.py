@@ -5,14 +5,38 @@ import kalshi_paper as kp
 
 
 class KalshiPaperPortfolioTests(unittest.TestCase):
-    def test_strategy_probability_shrinks_raw_edge(self):
+    def test_small_edge_uses_base_shrink(self):
         old = kp.MODEL_EDGE_SHRINK
         try:
             kp.MODEL_EDGE_SHRINK = 0.35
-            adjusted = kp.strategy_probability(0.90, 0.50)
-            self.assertAlmostEqual(adjusted, 0.64, places=6)
+            adjusted = kp.strategy_probability(0.55, 0.50, 24)
+            self.assertAlmostEqual(adjusted, 0.5175, places=6)
         finally:
             kp.MODEL_EDGE_SHRINK = old
+
+    def test_extreme_edge_is_heavily_shrunk(self):
+        old = kp.MODEL_EDGE_SHRINK
+        try:
+            kp.MODEL_EDGE_SHRINK = 0.35
+            adjusted = kp.strategy_probability(0.90, 0.50, 24)
+            self.assertAlmostEqual(adjusted, 0.52, places=6)
+            self.assertAlmostEqual(kp.effective_edge_shrink(0.40, 24), 0.05, places=6)
+        finally:
+            kp.MODEL_EDGE_SHRINK = old
+
+    def test_near_expiry_is_heavily_shrunk(self):
+        old = kp.MODEL_EDGE_SHRINK
+        try:
+            kp.MODEL_EDGE_SHRINK = 0.35
+            adjusted = kp.strategy_probability(0.60, 0.50, 1)
+            self.assertAlmostEqual(adjusted, 0.505, places=6)
+            self.assertAlmostEqual(kp.effective_edge_shrink(0.10, 1), 0.05, places=6)
+        finally:
+            kp.MODEL_EDGE_SHRINK = old
+
+    def test_empirical_risk_multiplier_downweights_bad_cohorts(self):
+        self.assertAlmostEqual(kp.empirical_risk_multiplier(0.35, 1), 0.01, places=6)
+        self.assertAlmostEqual(kp.empirical_risk_multiplier(0.05, 24), 1.0, places=6)
 
     def test_full_kelly_is_zero_without_positive_edge(self):
         self.assertEqual(kp.full_kelly_fraction(0.60, 0.60), 0.0)
