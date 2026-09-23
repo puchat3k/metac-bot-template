@@ -29,6 +29,11 @@ MAX_EVENT_NET_FRACTION = float(os.getenv("MAX_EVENT_NET_FRACTION", "0.35"))
 CONTRARIAN_EDGE_THRESHOLD = float(os.getenv("CONTRARIAN_EDGE_THRESHOLD", "0.20"))
 CONTRARIAN_HEDGE_FRACTION = float(os.getenv("CONTRARIAN_HEDGE_FRACTION", "0.50"))
 CONTRARIAN_MAX_POSITION_USD = float(os.getenv("CONTRARIAN_MAX_POSITION_USD", "10"))
+MODERATE_EDGE_MIN = float(os.getenv("MODERATE_EDGE_MIN", "0.05"))
+MODERATE_EDGE_MAX = float(os.getenv("MODERATE_EDGE_MAX", "0.10"))
+MODERATE_MIN_HOURS = float(os.getenv("MODERATE_MIN_HOURS", "12"))
+ANTI_LONGSHOT_THRESHOLD = float(os.getenv("ANTI_LONGSHOT_THRESHOLD", "0.10"))
+SHADOW_CHALLENGER_NOTIONAL_USD = float(os.getenv("SHADOW_CHALLENGER_NOTIONAL_USD", "1"))
 
 OUTPUT_DIR = Path(os.getenv("FORECAST_OUTPUT_ROOT", "outputs")) / "kalshi"
 
@@ -494,6 +499,86 @@ def build_control_position(now, bucket, close_at, market, market_p, bid, ask, re
     }
 
 
+
+def build_moderate_disagreement_challenger(primary):
+    """Shadow arm for the prospectively declared 5-10% raw-disagreement regime."""
+    raw_edge = abs(float(primary["metadata"].get("raw_model_edge", 0.0)))
+    horizon_hours = float(primary["metadata"].get("horizon_hours", 0.0))
+    if not (MODERATE_EDGE_MIN <= raw_edge <= MODERATE_EDGE_MAX):
+        return None
+    if horizon_hours < MODERATE_MIN_HOURS:
+        return None
+
+    return {
+        "venue": "kalshi-paper",
+        "source_opportunity_id": primary["source_opportunity_id"],
+        "title": primary["title"],
+        "model_key": "kalshi:moderate-disagreement-shadow:v1",
+        "forecast_probability": primary["forecast_probability"],
+        "market_probability": primary["market_probability"],
+        "edge": primary["edge"],
+        "direction": primary["direction"],
+        "notional_usd": round(SHADOW_CHALLENGER_NOTIONAL_USD, 2),
+        "locked_at": primary["locked_at"],
+        "lock_bucket": primary["lock_bucket"],
+        "closes_at": primary["closes_at"],
+        "status": "open",
+        "metadata": {
+            "paper_only": True,
+            "real_money": False,
+            "training_eligible": False,
+            "shadow_challenger": True,
+            "strategy_version": "moderate-disagreement-shadow-v1",
+            "hypothesis": "market-prior-plus-modest-independent-adjustment",
+            "source_strategy": primary["model_key"],
+            "raw_model_edge": round(float(primary["metadata"].get("raw_model_edge", 0.0)), 6),
+            "horizon_hours": round(horizon_hours, 3),
+            "edge_min": MODERATE_EDGE_MIN,
+            "edge_max": MODERATE_EDGE_MAX,
+            "min_horizon_hours": MODERATE_MIN_HOURS,
+            "event_ticker": primary["metadata"].get("event_ticker"),
+            "git_sha": os.getenv("GITHUB_SHA"),
+        },
+    }
+
+
+def build_anti_longshot_challenger(now, bucket, close_at, market, market_p):
+    """Shadow benchmark for the documented favorite-longshot anomaly."""
+    if market_p <= ANTI_LONGSHOT_THRESHOLD:
+        direction = "no"
+    elif market_p >= 1 - ANTI_LONGSHOT_THRESHOLD:
+        direction = "yes"
+    else:
+        return None
+
+    return {
+        "venue": "kalshi-paper",
+        "source_opportunity_id": market.get("ticker"),
+        "title": market.get("title"),
+        "model_key": "kalshi:anti-longshot-shadow:v1",
+        "forecast_probability": round(market_p, 6),
+        "market_probability": round(market_p, 6),
+        "edge": 0.0,
+        "direction": direction,
+        "notional_usd": round(SHADOW_CHALLENGER_NOTIONAL_USD, 2),
+        "locked_at": iso(now),
+        "lock_bucket": iso(bucket),
+        "closes_at": iso(close_at),
+        "status": "open",
+        "metadata": {
+            "paper_only": True,
+            "real_money": False,
+            "training_eligible": False,
+            "shadow_challenger": True,
+            "benchmark_challenger": True,
+            "strategy_version": "anti-longshot-shadow-v1",
+            "hypothesis": "favorite-longshot-bias",
+            "anti_longshot_threshold": ANTI_LONGSHOT_THRESHOLD,
+            "event_ticker": market.get("event_ticker"),
+            "git_sha": os.getenv("GITHUB_SHA"),
+        },
+    }
+
 def _trim_group_gross(records, cap):
     gross = sum(float(r["notional_usd"]) for r in records)
     if gross <= cap:
@@ -615,6 +700,9 @@ def main():
     control_records = []
     risk_records = []
     contrarian_records = []
+    moderate_records = []
+    anti_longshot_records = []
+    shadow_records = []
 
     for close_at, market, market_p, bid, ask in covered:
         ticker = market.get("ticker")
@@ -637,8 +725,20 @@ def main():
             )
         )
 
+        anti_longshot = build_anti_longshot_challenger(
+            now, bucket, close_at, market, market_p
+        )
+        if anti_longshot is not None:
+            anti_longshot_records.append(anti_longshot)
+            shadow_records.append(anti_longshot)
+
         if primary is None:
             continue
+
+        moderate = build_moderate_disagreement_challenger(primary)
+        if moderate is not None:
+            moderate_records.append(moderate)
+            shadow_records.append(moderate)
 
         risk_records.append(primary)
         raw_edge = abs(float(primary["metadata"].get("raw_model_edge", 0.0)))
@@ -650,7 +750,7 @@ def main():
     # Risk budget/correlation caps apply to active model strategies, not to the
     # $1 baseline observations used for paired evaluation.
     allocate_portfolio(risk_records)
-    records = control_records + risk_records
+    records = control_records + risk_records + shadow_records
 
     stamp = now.strftime("%Y%m%dT%H%M%SZ")
     records_path = OUTPUT_DIR / f"records-{stamp}.json"
@@ -661,6 +761,9 @@ def main():
     )
     control_count = len(control_records)
     contrarian_count = len(contrarian_records)
+    moderate_count = len(moderate_records)
+    anti_longshot_count = len(anti_longshot_records)
+    shadow_challenger_count = len(shadow_records)
     risk_gross_notional = round(
         sum(float(r["notional_usd"]) for r in risk_records), 2
     )
@@ -681,6 +784,9 @@ def main():
                 "risk_gross_notional_usd": risk_gross_notional,
                 "all_paper_notional_usd": all_paper_notional,
                 "contrarian_shadow_positions": contrarian_count,
+                "moderate_disagreement_shadow_positions": moderate_count,
+                "anti_longshot_shadow_positions": anti_longshot_count,
+                "shadow_challenger_positions": shadow_challenger_count,
                 "forecast_failures": failures,
                 "model": MODEL,
                 "paper_only": True,
@@ -692,6 +798,11 @@ def main():
                 "max_event_net_fraction": MAX_EVENT_NET_FRACTION,
                 "contrarian_edge_threshold": CONTRARIAN_EDGE_THRESHOLD,
                 "contrarian_hedge_fraction": CONTRARIAN_HEDGE_FRACTION,
+                "moderate_edge_min": MODERATE_EDGE_MIN,
+                "moderate_edge_max": MODERATE_EDGE_MAX,
+                "moderate_min_hours": MODERATE_MIN_HOURS,
+                "anti_longshot_threshold": ANTI_LONGSHOT_THRESHOLD,
+                "shadow_challenger_notional_usd": SHADOW_CHALLENGER_NOTIONAL_USD,
             },
             indent=2,
         ),
@@ -704,6 +815,8 @@ def main():
                 "primary": primary_count,
                 "controls": control_count,
                 "contrarian_shadow": contrarian_count,
+                "moderate_disagreement_shadow": moderate_count,
+                "anti_longshot_shadow": anti_longshot_count,
                 "forecast_failures": len(failures),
                 "risk_gross_notional_usd": risk_gross_notional,
                 "all_paper_notional_usd": all_paper_notional,
