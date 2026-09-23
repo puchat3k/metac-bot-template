@@ -142,5 +142,59 @@ class KalshiPaperPortfolioTests(unittest.TestCase):
         self.assertTrue(record["metadata"]["control_only"])
 
 
+    def test_moderate_disagreement_challenger_requires_declared_green_zone(self):
+        base = {
+            "source_opportunity_id": "TEST",
+            "title": "Test",
+            "model_key": "primary",
+            "forecast_probability": 0.52,
+            "market_probability": 0.50,
+            "edge": 0.02,
+            "direction": "yes",
+            "notional_usd": 5.0,
+            "locked_at": "2026-09-23T00:00:00+00:00",
+            "lock_bucket": "2026-09-23T00:00:00+00:00",
+            "closes_at": "2026-09-24T00:00:00+00:00",
+            "metadata": {
+                "raw_model_edge": 0.07,
+                "horizon_hours": 24.0,
+                "event_ticker": "EVENT",
+            },
+        }
+        challenger = kp.build_moderate_disagreement_challenger(base)
+        self.assertIsNotNone(challenger)
+        self.assertEqual(challenger["direction"], "yes")
+        self.assertFalse(challenger["metadata"]["training_eligible"])
+        self.assertTrue(challenger["metadata"]["shadow_challenger"])
+
+        too_large = {**base, "metadata": {**base["metadata"], "raw_model_edge": 0.21}}
+        self.assertIsNone(kp.build_moderate_disagreement_challenger(too_large))
+
+        too_late = {**base, "metadata": {**base["metadata"], "horizon_hours": 2.0}}
+        self.assertIsNone(kp.build_moderate_disagreement_challenger(too_late))
+
+    def test_anti_longshot_challenger_backs_favorite_side_only_at_extremes(self):
+        now = datetime.now(timezone.utc)
+        market = {"ticker": "TAIL", "title": "Tail", "event_ticker": "EVENT"}
+
+        low = kp.build_anti_longshot_challenger(
+            now, kp.six_hour_bucket(now), now + timedelta(days=1), market, 0.08
+        )
+        self.assertEqual(low["direction"], "no")
+        self.assertEqual(low["forecast_probability"], 0.08)
+        self.assertFalse(low["metadata"]["training_eligible"])
+        self.assertTrue(low["metadata"]["benchmark_challenger"])
+
+        high = kp.build_anti_longshot_challenger(
+            now, kp.six_hour_bucket(now), now + timedelta(days=1), market, 0.93
+        )
+        self.assertEqual(high["direction"], "yes")
+
+        middle = kp.build_anti_longshot_challenger(
+            now, kp.six_hour_bucket(now), now + timedelta(days=1), market, 0.50
+        )
+        self.assertIsNone(middle)
+
+
 if __name__ == "__main__":
     unittest.main()
