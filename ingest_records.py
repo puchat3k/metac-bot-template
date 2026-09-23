@@ -58,11 +58,29 @@ def main():
     records, paths = load_records()
     token = github_oidc_token()
 
-    ingest_result = {"ok": True, "result": {"upserted": 0}}
-    if records:
-        ingest_result = call_edge(token, {"op": "ingest", "records": records})
+    batch_size = 450  # forecast-ingest rejects payloads above 500 records
+    ingest_batches = []
+    upserted = 0
+    for start in range(0, len(records), batch_size):
+        batch = records[start : start + batch_size]
+        result = call_edge(token, {"op": "ingest", "records": batch})
+        ingest_batches.append(
+            {
+                "start": start,
+                "records": len(batch),
+                "result": result,
+            }
+        )
+        upserted += int(result.get("result", {}).get("upserted", 0))
 
-    resolve_result = call_edge(token, {"op": "resolve_kalshi"})
+    ingest_result = {
+        "ok": True,
+        "result": {
+            "upserted": upserted,
+            "batches": len(ingest_batches),
+        },
+        "batches": ingest_batches,
+    }
     summary_result = call_edge(token, {"op": "summary"})
 
     receipt = {
@@ -70,7 +88,10 @@ def main():
         "record_files": paths,
         "records_sent": len(records),
         "ingest": ingest_result,
-        "resolve_kalshi": resolve_result,
+        "resolution": {
+            "delegated_to": "forecast-resolver",
+            "schedule": "*/15 * * * *",
+        },
         "summary": summary_result,
         "git_sha": os.getenv("GITHUB_SHA"),
         "github_run_id": os.getenv("GITHUB_RUN_ID"),
