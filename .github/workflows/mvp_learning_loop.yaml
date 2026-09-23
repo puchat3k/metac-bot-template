@@ -55,8 +55,17 @@ jobs:
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           PAPER_MODEL: nvidia/nemotron-3-super-120b-a12b:free
-          KALSHI_MAX_MARKETS: "4"
-          PAPER_NOTIONAL_USD: "10"
+          KALSHI_MAX_MARKETS: "0"
+          KALSHI_MODEL_FORECASTS: "24"
+          KALSHI_FORECAST_WORKERS: "4"
+          PAPER_BANKROLL_USD: "1000"
+          PAPER_GROSS_NOTIONAL_USD: "500"
+          PAPER_MIN_POSITION_USD: "1"
+          PAPER_MAX_POSITION_USD: "25"
+          PAPER_KELLY_FRACTION: "0.5"
+          MODEL_EDGE_SHRINK: "0.35"
+          MAX_EVENT_GROSS_FRACTION: "0.20"
+          MAX_EVENT_NET_FRACTION: "0.35"
           FORECAST_OUTPUT_ROOT: outputs
 
       - name: Persist and resolve training records
