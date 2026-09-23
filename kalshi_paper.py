@@ -1,6 +1,9 @@
 import json
+import math
 import os
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -9,8 +12,21 @@ import requests
 KALSHI_BASE = "https://external-api.kalshi.com/trade-api/v2"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = os.getenv("PAPER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
-MAX_MARKETS = int(os.getenv("KALSHI_MAX_MARKETS", "8"))
-PAPER_NOTIONAL_USD = float(os.getenv("PAPER_NOTIONAL_USD", "10"))
+
+# Paper-learning coverage: 0 means all eligible markets returned by the API page.
+MAX_MARKETS = int(os.getenv("KALSHI_MAX_MARKETS", "0"))
+MODEL_FORECASTS = int(os.getenv("KALSHI_MODEL_FORECASTS", "24"))
+FORECAST_WORKERS = max(1, int(os.getenv("KALSHI_FORECAST_WORKERS", "4")))
+
+PAPER_BANKROLL_USD = float(os.getenv("PAPER_BANKROLL_USD", "1000"))
+PAPER_GROSS_NOTIONAL_USD = float(os.getenv("PAPER_GROSS_NOTIONAL_USD", "500"))
+PAPER_MIN_POSITION_USD = float(os.getenv("PAPER_MIN_POSITION_USD", "1"))
+PAPER_MAX_POSITION_USD = float(os.getenv("PAPER_MAX_POSITION_USD", "25"))
+PAPER_KELLY_FRACTION = float(os.getenv("PAPER_KELLY_FRACTION", "0.5"))
+MODEL_EDGE_SHRINK = float(os.getenv("MODEL_EDGE_SHRINK", "0.35"))
+MAX_EVENT_GROSS_FRACTION = float(os.getenv("MAX_EVENT_GROSS_FRACTION", "0.20"))
+MAX_EVENT_NET_FRACTION = float(os.getenv("MAX_EVENT_NET_FRACTION", "0.35"))
+
 OUTPUT_DIR = Path(os.getenv("FORECAST_OUTPUT_ROOT", "outputs")) / "kalshi"
 
 
@@ -19,6 +35,10 @@ def as_float(value, default=None):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
 
 
 def iso(value):
@@ -56,11 +76,27 @@ def fetch_open_markets():
     response = requests.get(
         f"{KALSHI_BASE}/markets",
         params={"status": "open", "mve_filter": "exclude", "limit": 300},
-        headers={"user-agent": "pk2sl-forecast-mvp/0.2"},
+        headers={"user-agent": "pk2sl-forecast-mvp/0.3"},
         timeout=30,
     )
     response.raise_for_status()
     return response.json().get("markets", [])
+
+
+def _learning_score(market, close_at, bid, ask):
+    now = datetime.now(timezone.utc)
+    hours = max(0.25, (close_at - now).total_seconds() / 3600)
+    volume = as_float(market.get("volume_fp"), 0.0) or 0.0
+    liquidity = as_float(market.get("liquidity_dollars"), 0.0) or 0.0
+    spread = (ask - bid) if bid is not None and ask is not None else 0.20
+    spread_quality = clamp(1 - spread / 0.20, 0, 1)
+    # Fast resolution + real liquidity produces faster, more useful feedback.
+    return (
+        math.log1p(max(0.0, volume))
+        + 2.0 * math.log1p(max(0.0, liquidity))
+        + 20.0 / (hours + 4.0)
+        + 2.0 * spread_quality
+    )
 
 
 def select_markets(markets):
@@ -84,13 +120,13 @@ def select_markets(markets):
         if bid is not None and ask is not None and ask - bid > 0.20:
             continue
 
-        volume = as_float(market.get("volume_fp"), 0.0) or 0.0
-        liquidity = as_float(market.get("liquidity_dollars"), 0.0) or 0.0
-        score = volume + (liquidity * 5)
+        score = _learning_score(market, close_at, bid, ask)
         candidates.append((score, close_at, market, probability, bid, ask))
 
     candidates.sort(key=lambda row: (-row[0], row[1]))
-    return candidates[:MAX_MARKETS]
+    if MAX_MARKETS > 0:
+        return candidates[:MAX_MARKETS]
+    return candidates
 
 
 def parse_probability(text):
@@ -98,7 +134,6 @@ def parse_probability(text):
         raise ValueError("empty_model_output")
     text = text.strip()
 
-    # First accept a clean JSON response.
     try:
         data = json.loads(text)
         value = float(data["probability"])
@@ -108,8 +143,6 @@ def parse_probability(text):
     except Exception:
         pass
 
-    # Some reasoning models emit prose before the requested JSON. Only accept an
-    # explicit probability field, never arbitrary decimals or arithmetic in prose.
     explicit = re.findall(
         r'["\']?probability["\']?\s*[:=]\s*(0(?:\.\d+)?|1(?:\.0+)?)',
         text,
@@ -137,7 +170,9 @@ def forecast_market(market):
     now = datetime.now(timezone.utc)
     prompt = f"""Estimate the probability that this Kalshi market resolves YES.
 Do not infer or guess the current market price. You are not shown the market price on purpose.
-Use base rates, the exact resolution rules, time remaining, and uncertainty. Avoid false precision.
+Use base rates, the exact resolution rules, time remaining, and uncertainty.
+Be conservative when the prompt does not contain enough current-world information.
+Do not create large probability moves from weak context. Avoid false precision.
 
 Current UTC date: {now.date().isoformat()}
 Title: {market.get('title')}
@@ -152,33 +187,250 @@ Return JSON only:
 {{"probability": 0.0, "rationale": "brief reason"}}
 Probability must be a decimal between 0 and 1."""
 
-    response = requests.post(
-        OPENROUTER_URL,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/puchat3k/metac-bot-template",
-            "X-Title": "PK2SL Forecast Learning MVP",
-        },
-        json={
-            "model": MODEL,
-            "temperature": 0.3,
-            "max_tokens": 1200,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You are a calibrated probabilistic forecaster. Conclude with an explicit probability field between 0 and 1.",
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = requests.post(
+                OPENROUTER_URL,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://github.com/puchat3k/metac-bot-template",
+                    "X-Title": "PK2SL Forecast Learning MVP",
                 },
-                {"role": "user", "content": prompt},
-            ],
-        },
-        timeout=120,
+                json={
+                    "model": MODEL,
+                    "temperature": 0.2,
+                    "max_tokens": 1200,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a calibrated probabilistic forecaster. "
+                                "Prefer conservative probabilities when evidence is weak. "
+                                "Conclude with an explicit probability field between 0 and 1."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                },
+                timeout=120,
+            )
+            if response.status_code == 429 or response.status_code >= 500:
+                raise RuntimeError(f"openrouter_retryable_{response.status_code}")
+            response.raise_for_status()
+            message = response.json()["choices"][0]["message"]
+            content = message.get("content") or message.get("reasoning")
+            probability, rationale = parse_probability(content)
+            return probability, rationale, prompt
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    raise RuntimeError(str(last_error or "forecast_failed"))
+
+
+def strategy_probability(model_probability, market_probability_):
+    """Shrink an unproven model toward the market prior rather than trusting raw edge 1:1."""
+    return clamp(
+        market_probability_ + MODEL_EDGE_SHRINK * (model_probability - market_probability_),
+        0.001,
+        0.999,
     )
-    response.raise_for_status()
-    message = response.json()["choices"][0]["message"]
-    content = message.get("content") or message.get("reasoning")
-    probability, rationale = parse_probability(content)
-    return probability, rationale, prompt
+
+
+def full_kelly_fraction(side_price, win_probability):
+    if side_price <= 0 or side_price >= 1:
+        return 0.0
+    return clamp((win_probability - side_price) / (1 - side_price), 0.0, 1.0)
+
+
+def liquidity_quality(market, bid, ask):
+    liquidity = max(0.0, as_float(market.get("liquidity_dollars"), 0.0) or 0.0)
+    volume = max(0.0, as_float(market.get("volume_fp"), 0.0) or 0.0)
+    spread = (ask - bid) if bid is not None and ask is not None else 0.20
+    spread_quality = clamp(1 - spread / 0.20, 0, 1)
+    liq_component = clamp(math.log1p(liquidity) / math.log1p(100000), 0, 1)
+    volume_component = clamp(math.log1p(volume) / math.log1p(100000), 0, 1)
+    return 0.5 * spread_quality + 0.3 * liq_component + 0.2 * volume_component
+
+
+def build_primary_position(now, bucket, close_at, market, market_p, bid, ask, model_p, rationale, prompt):
+    adjusted_p = strategy_probability(model_p, market_p)
+    raw_edge = model_p - market_p
+    edge = adjusted_p - market_p
+    direction = "yes" if edge >= 0 else "no"
+    side_price = market_p if direction == "yes" else 1 - market_p
+    win_probability = adjusted_p if direction == "yes" else 1 - adjusted_p
+    kelly_full = full_kelly_fraction(side_price, win_probability)
+    quality = liquidity_quality(market, bid, ask)
+    proposed = PAPER_BANKROLL_USD * PAPER_KELLY_FRACTION * kelly_full * max(0.20, quality)
+    proposed = clamp(proposed, PAPER_MIN_POSITION_USD, PAPER_MAX_POSITION_USD)
+
+    ticker = market.get("ticker")
+    return {
+        "venue": "kalshi-paper",
+        "source_opportunity_id": ticker,
+        "title": market.get("title"),
+        "model_key": f"openrouter:{MODEL}:kalshi-portfolio-v3",
+        "forecast_probability": round(adjusted_p, 6),
+        "market_probability": round(market_p, 6),
+        "edge": round(edge, 6),
+        "direction": direction,
+        "notional_usd": round(proposed, 2),
+        "locked_at": iso(now),
+        "lock_bucket": iso(bucket),
+        "closes_at": iso(close_at),
+        "status": "open",
+        "metadata": {
+            "paper_only": True,
+            "real_money": False,
+            "training_eligible": True,
+            "strategy_version": "kalshi-portfolio-v3",
+            "position_sizing": "market-prior-shrinkage+fractional-kelly+event-caps",
+            "prompt_version": "kalshi-portfolio-v3",
+            "model": MODEL,
+            "raw_model_probability": round(model_p, 6),
+            "raw_model_edge": round(raw_edge, 6),
+            "model_edge_shrink": MODEL_EDGE_SHRINK,
+            "kelly_full": round(kelly_full, 6),
+            "kelly_fraction": PAPER_KELLY_FRACTION,
+            "liquidity_quality": round(quality, 6),
+            "rationale": rationale,
+            "prompt": prompt,
+            "yes_bid": bid,
+            "yes_ask": ask,
+            "volume_fp": market.get("volume_fp"),
+            "liquidity_dollars": market.get("liquidity_dollars"),
+            "event_ticker": market.get("event_ticker"),
+            "rules_primary": market.get("rules_primary"),
+            "rules_secondary": market.get("rules_secondary"),
+            "git_sha": os.getenv("GITHUB_SHA"),
+        },
+    }
+
+
+def build_control_position(now, bucket, close_at, market, market_p, bid, ask, reason):
+    # Coverage/control only. It is explicitly excluded from model training because it
+    # contains no independent forecast edge.
+    direction = "yes" if market_p >= 0.5 else "no"
+    ticker = market.get("ticker")
+    return {
+        "venue": "kalshi-paper",
+        "source_opportunity_id": ticker,
+        "title": market.get("title"),
+        "model_key": "kalshi:market-control:v1",
+        "forecast_probability": round(market_p, 6),
+        "market_probability": round(market_p, 6),
+        "edge": 0.0,
+        "direction": direction,
+        "notional_usd": round(PAPER_MIN_POSITION_USD, 2),
+        "locked_at": iso(now),
+        "lock_bucket": iso(bucket),
+        "closes_at": iso(close_at),
+        "status": "open",
+        "metadata": {
+            "paper_only": True,
+            "real_money": False,
+            "training_eligible": False,
+            "control_only": True,
+            "strategy_version": "market-control-v1",
+            "control_reason": reason,
+            "yes_bid": bid,
+            "yes_ask": ask,
+            "volume_fp": market.get("volume_fp"),
+            "liquidity_dollars": market.get("liquidity_dollars"),
+            "event_ticker": market.get("event_ticker"),
+            "git_sha": os.getenv("GITHUB_SHA"),
+        },
+    }
+
+
+def _trim_group_gross(records, cap):
+    gross = sum(float(r["notional_usd"]) for r in records)
+    if gross <= cap:
+        return
+    for record in sorted(records, key=lambda r: abs(float(r.get("edge") or 0.0))):
+        if gross <= cap:
+            break
+        current = float(record["notional_usd"])
+        removable = max(0.0, current - PAPER_MIN_POSITION_USD)
+        if removable <= 0:
+            continue
+        reduction = min(removable, gross - cap)
+        record["notional_usd"] = round(current - reduction, 2)
+        record["metadata"]["event_gross_trim_usd"] = round(
+            float(record["metadata"].get("event_gross_trim_usd", 0.0)) + reduction, 2
+        )
+        gross -= reduction
+
+
+def _trim_group_net(records):
+    gross = sum(float(r["notional_usd"]) for r in records)
+    if gross <= 0:
+        return
+    net = sum(
+        float(r["notional_usd"]) if r["direction"] == "yes" else -float(r["notional_usd"])
+        for r in records
+    )
+    max_net = gross * MAX_EVENT_NET_FRACTION
+    if abs(net) <= max_net:
+        return
+
+    dominant = "yes" if net > 0 else "no"
+    for record in sorted(
+        [r for r in records if r["direction"] == dominant],
+        key=lambda r: abs(float(r.get("edge") or 0.0)),
+    ):
+        if abs(net) <= max_net:
+            break
+        current = float(record["notional_usd"])
+        removable = max(0.0, current - PAPER_MIN_POSITION_USD)
+        if removable <= 0:
+            continue
+        reduction = min(removable, abs(net) - max_net)
+        record["notional_usd"] = round(current - reduction, 2)
+        record["metadata"]["event_net_trim_usd"] = round(
+            float(record["metadata"].get("event_net_trim_usd", 0.0)) + reduction, 2
+        )
+        net += -reduction if dominant == "yes" else reduction
+
+
+def allocate_portfolio(records):
+    if not records:
+        return records
+
+    minimum_gross = PAPER_MIN_POSITION_USD * len(records)
+    target_gross = max(minimum_gross, PAPER_GROSS_NOTIONAL_USD)
+    current_gross = sum(float(r["notional_usd"]) for r in records)
+
+    if current_gross > target_gross:
+        total_extra = sum(
+            max(0.0, float(r["notional_usd"]) - PAPER_MIN_POSITION_USD)
+            for r in records
+        )
+        allowed_extra = max(0.0, target_gross - minimum_gross)
+        scale = 0.0 if total_extra <= 0 else min(1.0, allowed_extra / total_extra)
+        for record in records:
+            current = float(record["notional_usd"])
+            extra = max(0.0, current - PAPER_MIN_POSITION_USD)
+            record["notional_usd"] = round(PAPER_MIN_POSITION_USD + extra * scale, 2)
+            record["metadata"]["gross_book_scale"] = round(scale, 6)
+
+    groups = {}
+    for record in records:
+        group = str(record["metadata"].get("event_ticker") or record["source_opportunity_id"])
+        groups.setdefault(group, []).append(record)
+
+    event_gross_cap = max(
+        PAPER_MIN_POSITION_USD,
+        target_gross * MAX_EVENT_GROSS_FRACTION,
+    )
+    for group_records in groups.values():
+        _trim_group_gross(group_records, event_gross_cap)
+        _trim_group_net(group_records)
+
+    return records
 
 
 def main():
@@ -187,72 +439,94 @@ def main():
     bucket = six_hour_bucket(now)
     markets = fetch_open_markets()
     selected = select_markets(markets)
+
     records = []
     failures = []
+    primary_results = {}
 
-    for _, close_at, market, market_p, bid, ask in selected:
+    forecast_targets = selected[: max(0, MODEL_FORECASTS)]
+    with ThreadPoolExecutor(max_workers=min(FORECAST_WORKERS, max(1, len(forecast_targets)))) as pool:
+        futures = {
+            pool.submit(forecast_market, row[2]): row
+            for row in forecast_targets
+        }
+        for future in as_completed(futures):
+            _, close_at, market, market_p, bid, ask = futures[future]
+            ticker = market.get("ticker")
+            try:
+                model_p, rationale, prompt = future.result()
+                primary_results[ticker] = build_primary_position(
+                    now, bucket, close_at, market, market_p, bid, ask,
+                    model_p, rationale, prompt,
+                )
+            except Exception as exc:
+                failures.append({"ticker": ticker, "error": str(exc)[:300]})
+
+    for index, (_, close_at, market, market_p, bid, ask) in enumerate(selected):
         ticker = market.get("ticker")
-        try:
-            forecast_p, rationale, prompt = forecast_market(market)
-            edge = forecast_p - market_p
-            direction = "yes" if edge >= 0 else "no"
-            records.append(
-                {
-                    "venue": "kalshi-paper",
-                    "source_opportunity_id": ticker,
-                    "title": market.get("title"),
-                    "model_key": f"openrouter:{MODEL}:kalshi-mvp-v2",
-                    "forecast_probability": round(forecast_p, 6),
-                    "market_probability": round(market_p, 6),
-                    "edge": round(edge, 6),
-                    "direction": direction,
-                    "notional_usd": PAPER_NOTIONAL_USD,
-                    "locked_at": iso(now),
-                    "lock_bucket": iso(bucket),
-                    "closes_at": iso(close_at),
-                    "status": "open",
-                    "metadata": {
-                        "paper_only": True,
-                        "real_money": False,
-                        "training_eligible": True,
-                        "prompt_version": "kalshi-mvp-v2",
-                        "model": MODEL,
-                        "rationale": rationale,
-                        "prompt": prompt,
-                        "yes_bid": bid,
-                        "yes_ask": ask,
-                        "volume_fp": market.get("volume_fp"),
-                        "liquidity_dollars": market.get("liquidity_dollars"),
-                        "event_ticker": market.get("event_ticker"),
-                        "rules_primary": market.get("rules_primary"),
-                        "rules_secondary": market.get("rules_secondary"),
-                        "git_sha": os.getenv("GITHUB_SHA"),
-                    },
-                }
+        primary = primary_results.get(ticker)
+        if primary is not None:
+            records.append(primary)
+            continue
+
+        reason = (
+            "model_forecast_failed"
+            if index < len(forecast_targets)
+            else "outside_model_forecast_budget"
+        )
+        records.append(
+            build_control_position(
+                now, bucket, close_at, market, market_p, bid, ask, reason
             )
-        except Exception as exc:
-            failures.append({"ticker": ticker, "error": str(exc)[:300]})
+        )
+
+    allocate_portfolio(records)
 
     stamp = now.strftime("%Y%m%dT%H%M%SZ")
     records_path = OUTPUT_DIR / f"records-{stamp}.json"
     records_path.write_text(json.dumps(records, indent=2, ensure_ascii=False), encoding="utf-8")
+    primary_count = sum(
+        1 for r in records if r["metadata"].get("training_eligible") is True
+    )
+    control_count = len(records) - primary_count
+    gross_notional = round(sum(float(r["notional_usd"]) for r in records), 2)
+
     (OUTPUT_DIR / f"run-{stamp}.json").write_text(
         json.dumps(
             {
                 "observed_at": iso(now),
                 "markets_seen": len(markets),
-                "markets_selected": len(selected),
-                "forecasts_written": len(records),
-                "failures": failures,
+                "markets_eligible": len(selected),
+                "paper_positions_written": len(records),
+                "primary_model_positions": primary_count,
+                "control_positions": control_count,
+                "gross_notional_usd": gross_notional,
+                "forecast_failures": failures,
                 "model": MODEL,
                 "paper_only": True,
+                "strategy_version": "kalshi-portfolio-v3",
                 "parser_version": "strict-v2",
+                "model_edge_shrink": MODEL_EDGE_SHRINK,
+                "kelly_fraction": PAPER_KELLY_FRACTION,
+                "max_event_gross_fraction": MAX_EVENT_GROSS_FRACTION,
+                "max_event_net_fraction": MAX_EVENT_NET_FRACTION,
             },
             indent=2,
         ),
         encoding="utf-8",
     )
-    print(json.dumps({"kalshi_paper_records": len(records), "failures": len(failures), "path": str(records_path)}))
+    print(
+        json.dumps(
+            {
+                "kalshi_paper_positions": len(records),
+                "primary": primary_count,
+                "controls": control_count,
+                "forecast_failures": len(failures),
+                "gross_notional_usd": gross_notional,
+                "path": str(records_path),
+            }
+        )
+    )
 
 
 if __name__ == "__main__":
