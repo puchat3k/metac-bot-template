@@ -26,6 +26,9 @@ PAPER_KELLY_FRACTION = float(os.getenv("PAPER_KELLY_FRACTION", "0.5"))
 MODEL_EDGE_SHRINK = float(os.getenv("MODEL_EDGE_SHRINK", "0.35"))
 MAX_EVENT_GROSS_FRACTION = float(os.getenv("MAX_EVENT_GROSS_FRACTION", "0.20"))
 MAX_EVENT_NET_FRACTION = float(os.getenv("MAX_EVENT_NET_FRACTION", "0.35"))
+CONTRARIAN_EDGE_THRESHOLD = float(os.getenv("CONTRARIAN_EDGE_THRESHOLD", "0.20"))
+CONTRARIAN_HEDGE_FRACTION = float(os.getenv("CONTRARIAN_HEDGE_FRACTION", "0.50"))
+CONTRARIAN_MAX_POSITION_USD = float(os.getenv("CONTRARIAN_MAX_POSITION_USD", "10"))
 
 OUTPUT_DIR = Path(os.getenv("FORECAST_OUTPUT_ROOT", "outputs")) / "kalshi"
 
@@ -73,14 +76,31 @@ def market_probability(market):
 
 
 def fetch_open_markets():
-    response = requests.get(
-        f"{KALSHI_BASE}/markets",
-        params={"status": "open", "mve_filter": "exclude", "limit": 300},
-        headers={"user-agent": "pk2sl-forecast-mvp/0.4"},
-        timeout=30,
-    )
-    response.raise_for_status()
-    return response.json().get("markets", [])
+    """Walk the public cursor until the entire current open-market set is loaded."""
+    markets = []
+    cursor = None
+    seen_cursors = set()
+    while True:
+        params = {"status": "open", "mve_filter": "exclude", "limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+        response = requests.get(
+            f"{KALSHI_BASE}/markets",
+            params=params,
+            headers={"user-agent": "pk2sl-forecast-mvp/0.5"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        body = response.json()
+        markets.extend(body.get("markets", []))
+        next_cursor = body.get("cursor")
+        if not next_cursor:
+            break
+        if next_cursor in seen_cursors:
+            raise RuntimeError("kalshi pagination cursor repeated")
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    return markets
 
 
 def _learning_score(market, close_at, bid, ask):
@@ -113,10 +133,10 @@ def _learning_score(market, close_at, bid, ask):
     )
 
 
-def select_markets(markets):
+def coverage_markets(markets):
+    """All currently tradable binary markets with a usable paper entry price."""
     now = datetime.now(timezone.utc)
-    horizon = now + timedelta(days=60)
-    candidates = []
+    covered = []
     for market in markets:
         if market.get("market_type") != "binary" or market.get("is_provisional"):
             continue
@@ -125,11 +145,29 @@ def select_markets(markets):
             close_at = datetime.fromisoformat(str(close_raw).replace("Z", "+00:00"))
         except Exception:
             continue
-        if close_at <= now or close_at > horizon:
+        if close_at <= now:
             continue
 
         probability, bid, ask = market_probability(market)
-        if probability is None or probability <= 0.02 or probability >= 0.98:
+        if probability is None or probability <= 0 or probability >= 1:
+            continue
+        covered.append((close_at, market, probability, bid, ask))
+
+    covered.sort(key=lambda row: row[0])
+    if MAX_MARKETS > 0:
+        return covered[:MAX_MARKETS]
+    return covered
+
+
+def select_markets(covered):
+    """Quality-ranked subset eligible for scarce model inference."""
+    now = datetime.now(timezone.utc)
+    horizon = now + timedelta(days=60)
+    candidates = []
+    for close_at, market, probability, bid, ask in covered:
+        if close_at > horizon:
+            continue
+        if probability <= 0.02 or probability >= 0.98:
             continue
         if bid is not None and ask is not None and ask - bid > 0.20:
             continue
@@ -138,8 +176,6 @@ def select_markets(markets):
         candidates.append((score, close_at, market, probability, bid, ask))
 
     candidates.sort(key=lambda row: (-row[0], row[1]))
-    if MAX_MARKETS > 0:
-        return candidates[:MAX_MARKETS]
     return candidates
 
 
@@ -379,6 +415,49 @@ def build_primary_position(now, bucket, close_at, market, market_p, bid, ask, mo
     }
 
 
+def build_contrarian_position(primary):
+    """Paper-only shadow hedge for extreme model/market disagreement."""
+    market_p = float(primary["market_probability"])
+    primary_p = float(primary["forecast_probability"])
+    adjusted_edge = primary_p - market_p
+    raw_edge = float(primary["metadata"].get("raw_model_edge", adjusted_edge))
+    contrarian_p = clamp(market_p - adjusted_edge, 0.001, 0.999)
+    direction = "no" if primary["direction"] == "yes" else "yes"
+    proposed = clamp(
+        float(primary["notional_usd"]) * CONTRARIAN_HEDGE_FRACTION,
+        PAPER_MIN_POSITION_USD,
+        CONTRARIAN_MAX_POSITION_USD,
+    )
+    return {
+        "venue": "kalshi-paper",
+        "source_opportunity_id": primary["source_opportunity_id"],
+        "title": primary["title"],
+        "model_key": f"openrouter:{MODEL}:kalshi-contrarian-shadow-v1",
+        "forecast_probability": round(contrarian_p, 6),
+        "market_probability": round(market_p, 6),
+        "edge": round(-adjusted_edge, 6),
+        "direction": direction,
+        "notional_usd": round(proposed, 2),
+        "locked_at": primary["locked_at"],
+        "lock_bucket": primary["lock_bucket"],
+        "closes_at": primary["closes_at"],
+        "status": "open",
+        "metadata": {
+            "paper_only": True,
+            "real_money": False,
+            "training_eligible": False,
+            "shadow_challenger": True,
+            "strategy_version": "kalshi-contrarian-shadow-v1",
+            "hedges_strategy": primary["model_key"],
+            "raw_model_edge": round(raw_edge, 6),
+            "contrarian_edge_threshold": CONTRARIAN_EDGE_THRESHOLD,
+            "contrarian_hedge_fraction": CONTRARIAN_HEDGE_FRACTION,
+            "event_ticker": primary["metadata"].get("event_ticker"),
+            "git_sha": os.getenv("GITHUB_SHA"),
+        },
+    }
+
+
 def build_control_position(now, bucket, close_at, market, market_p, bid, ask, reason):
     # Coverage/control only. It is explicitly excluded from model training because it
     # contains no independent forecast edge.
@@ -507,13 +586,15 @@ def main():
     now = datetime.now(timezone.utc)
     bucket = six_hour_bucket(now)
     markets = fetch_open_markets()
-    selected = select_markets(markets)
+    covered = coverage_markets(markets)
+    selected = select_markets(covered)
 
     records = []
     failures = []
     primary_results = {}
 
     forecast_targets = selected[: max(0, MODEL_FORECASTS)]
+    forecast_target_tickers = {row[2].get("ticker") for row in forecast_targets}
     with ThreadPoolExecutor(max_workers=min(FORECAST_WORKERS, max(1, len(forecast_targets)))) as pool:
         futures = {
             pool.submit(forecast_market, row[2]): row
@@ -531,45 +612,75 @@ def main():
             except Exception as exc:
                 failures.append({"ticker": ticker, "error": str(exc)[:300]})
 
-    for index, (_, close_at, market, market_p, bid, ask) in enumerate(selected):
+    control_records = []
+    risk_records = []
+    contrarian_records = []
+
+    for close_at, market, market_p, bid, ask in covered:
         ticker = market.get("ticker")
         primary = primary_results.get(ticker)
-        if primary is not None:
-            records.append(primary)
-            continue
 
+        # Always keep a same-market baseline so the paper book covers the full
+        # open binary universe, even when a market is not worth an LLM call.
         reason = (
-            "model_forecast_failed"
-            if index < len(forecast_targets)
-            else "outside_model_forecast_budget"
+            "same_market_baseline"
+            if primary is not None
+            else (
+                "model_forecast_failed"
+                if ticker in forecast_target_tickers
+                else "outside_model_forecast_budget"
+            )
         )
-        records.append(
+        control_records.append(
             build_control_position(
                 now, bucket, close_at, market, market_p, bid, ask, reason
             )
         )
 
-    allocate_portfolio(records)
+        if primary is None:
+            continue
+
+        risk_records.append(primary)
+        raw_edge = abs(float(primary["metadata"].get("raw_model_edge", 0.0)))
+        if raw_edge >= CONTRARIAN_EDGE_THRESHOLD:
+            challenger = build_contrarian_position(primary)
+            contrarian_records.append(challenger)
+            risk_records.append(challenger)
+
+    # Risk budget/correlation caps apply to active model strategies, not to the
+    # $1 baseline observations used for paired evaluation.
+    allocate_portfolio(risk_records)
+    records = control_records + risk_records
 
     stamp = now.strftime("%Y%m%dT%H%M%SZ")
     records_path = OUTPUT_DIR / f"records-{stamp}.json"
     records_path.write_text(json.dumps(records, indent=2, ensure_ascii=False), encoding="utf-8")
     primary_count = sum(
-        1 for r in records if r["metadata"].get("training_eligible") is True
+        1 for r in risk_records
+        if r["metadata"].get("training_eligible") is True
     )
-    control_count = len(records) - primary_count
-    gross_notional = round(sum(float(r["notional_usd"]) for r in records), 2)
+    control_count = len(control_records)
+    contrarian_count = len(contrarian_records)
+    risk_gross_notional = round(
+        sum(float(r["notional_usd"]) for r in risk_records), 2
+    )
+    all_paper_notional = round(
+        sum(float(r["notional_usd"]) for r in records), 2
+    )
 
     (OUTPUT_DIR / f"run-{stamp}.json").write_text(
         json.dumps(
             {
                 "observed_at": iso(now),
                 "markets_seen": len(markets),
-                "markets_eligible": len(selected),
+                "markets_covered": len(covered),
+                "model_candidate_markets": len(selected),
                 "paper_positions_written": len(records),
                 "primary_model_positions": primary_count,
                 "control_positions": control_count,
-                "gross_notional_usd": gross_notional,
+                "risk_gross_notional_usd": risk_gross_notional,
+                "all_paper_notional_usd": all_paper_notional,
+                "contrarian_shadow_positions": contrarian_count,
                 "forecast_failures": failures,
                 "model": MODEL,
                 "paper_only": True,
@@ -579,6 +690,8 @@ def main():
                 "kelly_fraction": PAPER_KELLY_FRACTION,
                 "max_event_gross_fraction": MAX_EVENT_GROSS_FRACTION,
                 "max_event_net_fraction": MAX_EVENT_NET_FRACTION,
+                "contrarian_edge_threshold": CONTRARIAN_EDGE_THRESHOLD,
+                "contrarian_hedge_fraction": CONTRARIAN_HEDGE_FRACTION,
             },
             indent=2,
         ),
@@ -590,8 +703,10 @@ def main():
                 "kalshi_paper_positions": len(records),
                 "primary": primary_count,
                 "controls": control_count,
+                "contrarian_shadow": contrarian_count,
                 "forecast_failures": len(failures),
-                "gross_notional_usd": gross_notional,
+                "risk_gross_notional_usd": risk_gross_notional,
+                "all_paper_notional_usd": all_paper_notional,
                 "path": str(records_path),
             }
         )

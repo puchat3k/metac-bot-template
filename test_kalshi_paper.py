@@ -38,6 +38,22 @@ class KalshiPaperPortfolioTests(unittest.TestCase):
         self.assertAlmostEqual(kp.empirical_risk_multiplier(0.35, 1), 0.01, places=6)
         self.assertAlmostEqual(kp.empirical_risk_multiplier(0.05, 24), 1.0, places=6)
 
+    def test_coverage_keeps_extreme_or_wide_spread_markets_outside_model_filter(self):
+        now = datetime.now(timezone.utc)
+        market = {
+            "ticker": "EXTREME",
+            "title": "Extreme priced market",
+            "market_type": "binary",
+            "is_provisional": False,
+            "close_time": (now + timedelta(days=2)).isoformat(),
+            "yes_bid_dollars": "0.005",
+            "yes_ask_dollars": "0.025",
+            "no_bid_dollars": "0.975",
+        }
+        covered = kp.coverage_markets([market])
+        self.assertEqual(len(covered), 1)
+        self.assertEqual(kp.select_markets(covered), [])
+
     def test_full_kelly_is_zero_without_positive_edge(self):
         self.assertEqual(kp.full_kelly_fraction(0.60, 0.60), 0.0)
         self.assertGreater(kp.full_kelly_fraction(0.40, 0.60), 0.0)
@@ -73,6 +89,36 @@ class KalshiPaperPortfolioTests(unittest.TestCase):
             kp.PAPER_GROSS_NOTIONAL_USD = old_gross
             kp.MAX_EVENT_GROSS_FRACTION = old_event
             kp.MAX_EVENT_NET_FRACTION = old_net
+
+
+    def test_contrarian_shadow_inverts_primary_and_is_not_training_eligible(self):
+        primary = {
+            "source_opportunity_id": "TEST",
+            "title": "Test",
+            "model_key": "primary",
+            "forecast_probability": 0.52,
+            "market_probability": 0.50,
+            "edge": 0.02,
+            "direction": "yes",
+            "notional_usd": 4.0,
+            "locked_at": "2026-09-23T00:00:00+00:00",
+            "lock_bucket": "2026-09-23T00:00:00+00:00",
+            "closes_at": "2026-09-24T00:00:00+00:00",
+            "metadata": {
+                "raw_model_edge": 0.40,
+                "event_ticker": "EVENT",
+            },
+        }
+        hedge = kp.build_contrarian_position(primary)
+        self.assertEqual(hedge["direction"], "no")
+        self.assertAlmostEqual(hedge["forecast_probability"], 0.48, places=6)
+        self.assertFalse(hedge["metadata"]["training_eligible"])
+        self.assertTrue(hedge["metadata"]["shadow_challenger"])
+        self.assertEqual(hedge["notional_usd"], 2.0)
+
+    def test_contrarian_threshold_targets_only_extreme_raw_disagreement(self):
+        self.assertGreaterEqual(0.25, kp.CONTRARIAN_EDGE_THRESHOLD)
+        self.assertLess(0.10, kp.CONTRARIAN_EDGE_THRESHOLD)
 
     def test_control_position_is_not_training_eligible(self):
         now = datetime.now(timezone.utc)
